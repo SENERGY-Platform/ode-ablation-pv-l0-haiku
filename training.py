@@ -8,12 +8,16 @@ store. It returns Ray Datasets, so the training below never holds the whole
 history in one process.
 
 The model is a seasonal profile of the PV power itself: for each calendar month
-and each hour of the day, the mean of the hourly means observed in that cell over
-the training window. A 24 hour ahead forecast is then the profile cell for the hour
-it is about. It uses no weather, so it follows the season and not the cloud cover.
+and each hour of the day, the median of the hourly means observed in that cell
+over the training window. The median is the value that minimises absolute error,
+which is what the evaluation scores; a few cloudy days in a cell do not drag the
+profile down the way a mean would. A 24 hour ahead forecast is the profile cell
+for the hour it is about. It uses no weather, so it follows the season and not the
+cloud cover.
 """
 
 import datetime
+import statistics
 import typing
 
 import pandas as pd
@@ -90,32 +94,25 @@ def _hourly_sums(datasets: typing.List[typing.Any]) -> typing.Dict[str, typing.L
 
 
 def _profiles(sums: typing.Dict[str, typing.List[float]]):
-    """Hourly means, then the mean of those per (month, hour) and per hour alone."""
-    cell_total = [0.0] * 288
-    cell_days = [0] * 288
-    hour_total = [0.0] * 24
-    hour_days = [0] * 24
-    hourly_total = 0.0
-    hourly_count = 0
+    """Hourly means, then the median of those per (month, hour) and per hour alone."""
+    cell_values: typing.List[typing.List[float]] = [[] for _ in range(288)]
+    hour_values: typing.List[typing.List[float]] = [[] for _ in range(24)]
+    hourly: typing.List[float] = []
     for key, (total, count) in sums.items():
         if count <= 0:
             continue
         mean = total / count
         at = pd.Timestamp(key)
-        cell = _cell(at.month, at.hour)
-        cell_total[cell] += mean
-        cell_days[cell] += 1
-        hour_total[at.hour] += mean
-        hour_days[at.hour] += 1
-        hourly_total += mean
-        hourly_count += 1
+        cell_values[_cell(at.month, at.hour)].append(mean)
+        hour_values[at.hour].append(mean)
+        hourly.append(mean)
 
-    if hourly_count == 0:
+    if not hourly:
         return None, None, 0, 0.0
 
-    month_hour = [cell_total[i] / cell_days[i] if cell_days[i] else None for i in range(288)]
-    hour = [hour_total[h] / hour_days[h] if hour_days[h] else 0.0 for h in range(24)]
-    return month_hour, hour, hourly_count, hourly_total / hourly_count
+    month_hour = [statistics.median(v) if v else None for v in cell_values]
+    hour = [statistics.median(v) if v else 0.0 for v in hour_values]
+    return month_hour, hour, len(hourly), statistics.fmean(hourly)
 
 
 def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
@@ -138,6 +135,7 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
     logger.log_params({
         "training_window_days": TRAINING_WINDOW.days,
         "method": "month_hour_profile",
+        "statistic": "median",
         "horizon_hours": 24,
     })
     logger.log_metrics({
