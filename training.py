@@ -6,19 +6,30 @@ operator's own process for every message, while this runs distributed and rarely
 provide_historic_data() is Operator Lib's reader over the platform's timeseries
 store. It returns Ray Datasets, so the training below never holds the whole
 history in one process.
+
+The model is a seasonal profile of the PV power itself: for each calendar month
+and each hour of the day, the mean of the hourly means observed in that cell over
+the training window. A 24 hour ahead forecast is then the profile cell for the hour
+it is about. It uses no weather, so it follows the season and not the cloud cover.
 """
 
 import datetime
 import typing
 
+import pandas as pd
 import ray
 from mlflow.pyfunc import PythonModel
 
 from operator_lib.util.helpers import provide_historic_data, TrainMlflowLogger
 
 
-# How much history one training pass reads.
-TRAINING_WINDOW = datetime.timedelta(days=90)
+# How much history one training pass reads. A year, so every calendar month is
+# represented once in the training window and the test window's season is in it.
+TRAINING_WINDOW = datetime.timedelta(days=365)
+
+# Index of a (month, hour) cell in the profile table.
+def _cell(month: int, hour: int) -> int:
+    return (month - 1) * 24 + hour
 
 
 class OdeAblationPvL0HaikuModel(PythonModel):
@@ -26,43 +37,89 @@ class OdeAblationPvL0HaikuModel(PythonModel):
 
     predict() receives exactly the payload infer() builds, so the two are one
     contract in two files. Keep it serialisable: MLflow stores this object.
+
+    month_hour is 288 cells, (month - 1) * 24 + hour, None where the training
+    window held no data for that cell. hour is 24 cells, the fallback for a
+    month-hour cell with no data.
     """
 
-    def __init__(self, baseline: float) -> None:
-        self.baseline = baseline
+    def __init__(self, month_hour: typing.List[typing.Optional[float]], hour: typing.List[float]) -> None:
+        self.month_hour = month_hour
+        self.hour = hour
 
     def predict(self, context, model_input=None, params=None):
         # The pyfunc signature carries a context when MLflow calls it and not when the
         # model is called directly, so the payload is taken from whichever argument
         # holds it.
         payload = model_input if model_input is not None else context
-        value = float(payload.get("value", 0.0))
-        return value - self.baseline
+        at = payload["timestamp"]
+        value = self.month_hour[_cell(at.month, at.hour)]
+        if value is None:
+            value = self.hour[at.hour]
+        return max(0.0, float(value))
 
 
 @ray.remote
-def _fit(datasets: typing.List[typing.Any]) -> float:
-    """The distributed part. Replace the body; keep the shape.
+def _hourly_sums(datasets: typing.List[typing.Any]) -> typing.Dict[str, typing.List[float]]:
+    """The distributed part: per (day, hour), the sum and count of samples.
 
-    A Ray task rather than a plain function so that training scales with the
-    cluster rather than with the operator's pod.
+    Summed per hour rather than per sample, so that an irregular sampling
+    interval does not weight the busy hours of the day more than the quiet ones.
+    Returns a plain dict of [sum, count] keyed by the hour's ISO timestamp, which
+    is small enough to come back to the driver whole.
     """
-    total, count = 0.0, 0
+    sums: typing.Dict[str, typing.List[float]] = {}
     for dataset in datasets:
-        for batch in dataset.iter_batches(batch_size=4096):
-            values = batch.get("value")
-            if values is None:
+        ds = ray.get(dataset) if isinstance(dataset, ray.ObjectRef) else dataset
+        for batch in ds.iter_batches(batch_size=4096, batch_format="pandas"):
+            if "time" not in batch or "value" not in batch:
+                raise ValueError("history batch carries no time or value column")
+            frame = pd.DataFrame({
+                "time": pd.to_datetime(batch["time"], utc=True),
+                "value": pd.to_numeric(batch["value"], errors="coerce"),
+            }).dropna()
+            if frame.empty:
                 continue
-            for value in values:
-                if value is None:
-                    continue
-                total += float(value)
-                count += 1
-    return total / count if count else 0.0
+            grouped = frame.groupby(frame["time"].dt.floor("h"))["value"].agg(["sum", "count"])
+            for hour, row in grouped.iterrows():
+                key = hour.isoformat()
+                acc = sums.setdefault(key, [0.0, 0.0])
+                acc[0] += float(row["sum"])
+                acc[1] += float(row["count"])
+    return sums
+
+
+def _profiles(sums: typing.Dict[str, typing.List[float]]):
+    """Hourly means, then the mean of those per (month, hour) and per hour alone."""
+    cell_total = [0.0] * 288
+    cell_days = [0] * 288
+    hour_total = [0.0] * 24
+    hour_days = [0] * 24
+    hourly_total = 0.0
+    hourly_count = 0
+    for key, (total, count) in sums.items():
+        if count <= 0:
+            continue
+        mean = total / count
+        at = pd.Timestamp(key)
+        cell = _cell(at.month, at.hour)
+        cell_total[cell] += mean
+        cell_days[cell] += 1
+        hour_total[at.hour] += mean
+        hour_days[at.hour] += 1
+        hourly_total += mean
+        hourly_count += 1
+
+    if hourly_count == 0:
+        return None, None, 0, 0.0
+
+    month_hour = [cell_total[i] / cell_days[i] if cell_days[i] else None for i in range(288)]
+    hour = [hour_total[h] / hour_days[h] if hour_days[h] else 0.0 for h in range(24)]
+    return month_hour, hour, hourly_count, hourly_total / hourly_count
 
 
 def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
-    """Read the history, fit, and hand back a model for MLflow to register."""
+    """Read the history, fit the monthly-hourly profile, and hand back a model for MLflow to register."""
     with logger.trace("read history"):
         datasets = provide_historic_data(TRAINING_WINDOW)
     if not datasets:
@@ -71,8 +128,21 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         return None
 
     with logger.trace("fit"):
-        baseline = ray.get(_fit.remote(datasets))
+        sums = ray.get(_hourly_sums.remote(datasets))
+        month_hour, hour, hourly_count, mean_hourly = _profiles(sums)
 
-    logger.log_params({"training_window_days": TRAINING_WINDOW.days})
-    logger.log_metrics({"baseline": baseline})
-    return OdeAblationPvL0HaikuModel(baseline=baseline)
+    if month_hour is None:
+        return None
+
+    filled = sum(1 for cell in month_hour if cell is not None)
+    logger.log_params({
+        "training_window_days": TRAINING_WINDOW.days,
+        "method": "month_hour_profile",
+        "horizon_hours": 24,
+    })
+    logger.log_metrics({
+        "train_hours": float(hourly_count),
+        "train_cells_filled": float(filled),
+        "train_mean_hourly": mean_hourly,
+    })
+    return OdeAblationPvL0HaikuModel(month_hour=month_hour, hour=hour)

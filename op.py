@@ -20,6 +20,11 @@ from operator_lib.util.helpers import TrainMlflowLogger
 from training import train_model
 
 
+# The forecast horizon: each result is the hourly mean power for the hour this far
+# after the message that produced it.
+HORIZON = datetime.timedelta(hours=24)
+
+
 class CustomConfig(Config):
     """Deployment configuration, typed.
 
@@ -62,17 +67,20 @@ class Operator(MLOperator):
     ]:
         """Called for every message. Returns (result timestamp, result, new model).
 
-        The result timestamp may be None, which means now; it is what lets a
-        forecast carry the time it is about rather than the time it was made. The
-        third element replaces the registered model and is almost always None —
-        return one only from an algorithm that genuinely updates per message.
+        The message is the trigger: its value is present, but the forecast is the
+        seasonal profile at the hour HORIZON after it, so the result carries that
+        hour as its timestamp. Several messages in one hour answer the same hour,
+        and the evaluation averages them within the bucket.
         """
         value = data.get("value")
         if value is None or model is None:
             return None, None, None
 
-        prediction = model.predict({"timestamp": timestamp, "value": float(value)})
-        return None, {"prediction": prediction}, None
+        at = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=datetime.timezone.utc)
+        target = at.replace(minute=0, second=0, microsecond=0) + HORIZON
+
+        prediction = model.predict({"timestamp": target, "value": float(value)})
+        return target, {"prediction": prediction}, None
 
     def train(
         self, model: typing.Optional[PyFuncModel], logger: TrainMlflowLogger
